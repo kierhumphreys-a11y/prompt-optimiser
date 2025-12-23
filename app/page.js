@@ -28,6 +28,7 @@ export default function Home() {
   const [isRegenerating, setIsRegenerating] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [isImplementingSuggestions, setIsImplementingSuggestions] = useState(false);
+  const [suggestionsImplemented, setSuggestionsImplemented] = useState(false);
 
   const vendors = Object.keys(GUIDANCE);
   const currentGuidance = GUIDANCE[selectedVendor];
@@ -59,6 +60,7 @@ export default function Home() {
     setProblemContext('');
     setShowProblemContext(false);
     setRetryCount(0);
+    setSuggestionsImplemented(false);
   };
 
   const handleInputChange = (text) => {
@@ -151,6 +153,7 @@ export default function Home() {
       setResult(data);
       setPhase('result');
       setRetryCount(0);
+      setSuggestionsImplemented(false);
 
     } catch (err) {
       setError(err.message);
@@ -197,6 +200,7 @@ export default function Home() {
       }
 
       setResult(data);
+      setSuggestionsImplemented(false);
 
     } catch (err) {
       setError(err.message);
@@ -246,6 +250,7 @@ export default function Home() {
       }
 
       setResult(data);
+      setSuggestionsImplemented(true);
 
     } catch (err) {
       setError(err.message);
@@ -673,7 +678,7 @@ Examples:
               </div>
             )}
 
-            {result.suggestions && result.suggestions.length > 0 && (
+            {result.suggestions && result.suggestions.length > 0 && !suggestionsImplemented && (
               <div className="mt-6">
                 <h3 className="text-sm font-medium text-slate-400 mb-2">Further improvements</h3>
                 <ul className="text-sm text-slate-400 space-y-1 mb-3">
