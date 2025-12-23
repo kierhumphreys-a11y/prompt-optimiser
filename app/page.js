@@ -1,7 +1,17 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { GUIDANCE } from '@/lib/guidance';
+import { ProgressIndicator, ModelSelector, QuestionCard, ResultDisplay } from './components';
+
+// Helper to build additional context from answered questions
+function buildAdditionalContext(critique, answers) {
+  const answeredQuestions = critique?.questions?.filter(q => answers[q.id]?.trim()) || [];
+  if (answeredQuestions.length === 0) return '';
+  return answeredQuestions
+    .map(q => `Q: ${q.question}\nA: ${answers[q.id]}`)
+    .join('\n\n');
+}
 
 export default function Home() {
   // Entry mode: 'idea' or 'prompt'
@@ -28,27 +38,21 @@ export default function Home() {
   const [isRegenerating, setIsRegenerating] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
 
-  const vendors = Object.keys(GUIDANCE);
-  const currentGuidance = GUIDANCE[selectedVendor];
+  // Memoized computed values
+  const currentGuidance = useMemo(() => GUIDANCE[selectedVendor], [selectedVendor]);
 
-  const handleVendorChange = (vendor) => {
-    if (phase === 'result') {
-      regenerateForModel(vendor, GUIDANCE[vendor].models[0]);
-    } else if (phase === 'input') {
-      setSelectedVendor(vendor);
-      setSelectedModel(GUIDANCE[vendor].models[0]);
-    }
-  };
+  const answeredCount = useMemo(() =>
+    critique?.questions?.filter(q => answers[q.id]?.trim()).length || 0,
+    [critique?.questions, answers]
+  );
 
-  const handleModelChange = (model) => {
-    if (phase === 'result') {
-      regenerateForModel(selectedVendor, model);
-    } else {
-      setSelectedModel(model);
-    }
-  };
+  const totalQuestions = useMemo(() =>
+    critique?.questions?.length || 0,
+    [critique?.questions]
+  );
 
-  const resetToStart = () => {
+  // Memoized callbacks to prevent unnecessary re-renders
+  const resetToStart = useCallback(() => {
     setPhase('input');
     setEntryMode(null);
     setCritique(null);
@@ -58,20 +62,48 @@ export default function Home() {
     setProblemContext('');
     setShowProblemContext(false);
     setRetryCount(0);
-  };
+  }, []);
 
-  const handleInputChange = (text) => {
+  // Debounce the heavy state reset when user types (clear critique/answers/result)
+  const resetTimeoutRef = useRef(null);
+
+  const handleInputChange = useCallback((text) => {
+    // Immediate update for responsive typing
     setInputText(text);
+
+    // Debounce the expensive state resets (300ms delay)
     if (phase !== 'input') {
-      setPhase('input');
-      setCritique(null);
-      setAnswers({});
-      setResult(null);
+      if (resetTimeoutRef.current) {
+        clearTimeout(resetTimeoutRef.current);
+      }
+      resetTimeoutRef.current = setTimeout(() => {
+        setPhase('input');
+        setCritique(null);
+        setAnswers({});
+        setResult(null);
+      }, 300);
     }
-  };
+  }, [phase]);
+
+  // Cleanup timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (resetTimeoutRef.current) {
+        clearTimeout(resetTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const updateAnswer = useCallback((questionId, value) => {
+    setAnswers(prev => ({ ...prev, [questionId]: value }));
+  }, []);
+
+  const copyToClipboard = useCallback((text) => {
+    navigator.clipboard.writeText(text);
+  }, []);
 
   // Phase 1: Get critique
-  const runCritique = async () => {
+  const runCritique = useCallback(async () => {
     if (!inputText.trim() || inputText.trim().length < 5) {
       setError('Please provide more detail.');
       return;
@@ -111,21 +143,14 @@ export default function Home() {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [inputText, selectedVendor, selectedModel, entryMode, problemContext]);
 
   // Phase 2: Generate with answers
-  const runGenerate = async () => {
+  const runGenerate = useCallback(async () => {
     setIsLoading(true);
     setError('');
 
-    const answeredQuestions = critique?.questions?.filter(q => answers[q.id]?.trim()) || [];
-    let additionalContext = '';
-    
-    if (answeredQuestions.length > 0) {
-      additionalContext = answeredQuestions
-        .map(q => `Q: ${q.question}\nA: ${answers[q.id]}`)
-        .join('\n\n');
-    }
+    const additionalContext = buildAdditionalContext(critique, answers);
 
     try {
       const response = await fetch('/api/analyse', {
@@ -157,23 +182,16 @@ export default function Home() {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [critique, answers, selectedVendor, selectedModel, inputText, problemContext]);
 
   // Regenerate for a different model
-  const regenerateForModel = async (newVendor, newModel) => {
+  const regenerateForModel = useCallback(async (newVendor, newModel) => {
     setIsRegenerating(true);
     setSelectedVendor(newVendor);
     setSelectedModel(newModel);
     setError('');
 
-    const answeredQuestions = critique?.questions?.filter(q => answers[q.id]?.trim()) || [];
-    let additionalContext = '';
-    
-    if (answeredQuestions.length > 0) {
-      additionalContext = answeredQuestions
-        .map(q => `Q: ${q.question}\nA: ${answers[q.id]}`)
-        .join('\n\n');
-    }
+    const additionalContext = buildAdditionalContext(critique, answers);
 
     try {
       const response = await fetch('/api/analyse', {
@@ -202,18 +220,30 @@ export default function Home() {
     } finally {
       setIsRegenerating(false);
     }
-  };
+  }, [critique, answers, inputText, problemContext]);
 
-  const updateAnswer = (questionId, value) => {
-    setAnswers(prev => ({ ...prev, [questionId]: value }));
-  };
+  // Handler callbacks that depend on regenerateForModel
+  const handleVendorChange = useCallback((vendor) => {
+    if (phase === 'result') {
+      regenerateForModel(vendor, GUIDANCE[vendor].models[0]);
+    } else if (phase === 'input') {
+      setSelectedVendor(vendor);
+      setSelectedModel(GUIDANCE[vendor].models[0]);
+    }
+  }, [phase, regenerateForModel]);
 
-  const copyToClipboard = (text) => {
-    navigator.clipboard.writeText(text);
-  };
+  const handleModelChange = useCallback((model) => {
+    if (phase === 'result') {
+      regenerateForModel(selectedVendor, model);
+    } else {
+      setSelectedModel(model);
+    }
+  }, [phase, selectedVendor, regenerateForModel]);
 
-  const answeredCount = critique?.questions?.filter(q => answers[q.id]?.trim()).length || 0;
-  const totalQuestions = critique?.questions?.length || 0;
+  const handleStartNew = useCallback(() => {
+    setInputText('');
+    resetToStart();
+  }, [resetToStart]);
 
   return (
     <div className="min-h-screen p-4 md:p-6">
@@ -231,73 +261,17 @@ export default function Home() {
         </div>
 
         {/* Progress indicator */}
-        <div className="flex items-center gap-2 mb-6">
-          {['input', 'critique', 'result'].map((p, i) => (
-            <div key={p} className="flex items-center">
-              <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium transition-colors ${
-                phase === p ? 'bg-blue-600 text-white' :
-                ['input', 'critique', 'result'].indexOf(phase) > i ? 'bg-green-600 text-white' :
-                'bg-slate-700 text-slate-400'
-              }`}>
-                {['input', 'critique', 'result'].indexOf(phase) > i ? '✓' : i + 1}
-              </div>
-              {i < 2 && (
-                <div className={`w-8 md:w-12 h-0.5 transition-colors ${
-                  ['input', 'critique', 'result'].indexOf(phase) > i ? 'bg-green-600' : 'bg-slate-700'
-                }`} />
-              )}
-            </div>
-          ))}
-          <span className="text-sm text-slate-500 ml-2">
-            {phase === 'input' && (entryMode ? (entryMode === 'idea' ? 'Describe idea' : 'Paste prompt') : 'Choose entry')}
-            {phase === 'critique' && 'Answer questions'}
-            {phase === 'result' && 'Done'}
-          </span>
-        </div>
+        <ProgressIndicator phase={phase} entryMode={entryMode} />
 
         {/* Model Selection */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-          <div>
-            <label className="block text-sm font-medium text-slate-300 mb-2">
-              Target Model
-              {phase === 'result' && <span className="text-blue-400 ml-2 text-xs">(click to adapt)</span>}
-            </label>
-            <div className="flex flex-wrap gap-2">
-              {vendors.map(vendor => (
-                <button
-                  key={vendor}
-                  onClick={() => handleVendorChange(vendor)}
-                  disabled={phase === 'critique' || isRegenerating}
-                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
-                    selectedVendor === vendor
-                      ? 'bg-blue-600 text-white'
-                      : phase === 'critique'
-                        ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                        : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
-                  } ${isRegenerating ? 'opacity-50' : ''}`}
-                >
-                  {GUIDANCE[vendor].name}
-                </button>
-              ))}
-            </div>
-          </div>
-          
-          <div>
-            <label className="block text-sm font-medium text-slate-300 mb-2">
-              Variant
-            </label>
-            <select
-              value={selectedModel}
-              onChange={(e) => handleModelChange(e.target.value)}
-              disabled={phase === 'critique' || isRegenerating}
-              className="w-full bg-slate-700 border border-slate-600 rounded-lg px-4 py-2 text-white text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {currentGuidance.models.map(model => (
-                <option key={model} value={model}>{model}</option>
-              ))}
-            </select>
-          </div>
-        </div>
+        <ModelSelector
+          selectedVendor={selectedVendor}
+          selectedModel={selectedModel}
+          phase={phase}
+          isRegenerating={isRegenerating}
+          onVendorChange={handleVendorChange}
+          onModelChange={handleModelChange}
+        />
 
         {/* Entry Mode Selection */}
         {phase === 'input' && !entryMode && (
@@ -480,34 +454,14 @@ Examples:
 
             <div className="space-y-4">
               {critique.questions?.map((q, i) => (
-                <div key={q.id} className="bg-slate-700/50 rounded-lg p-4">
-                  <div className="flex items-start gap-3 mb-2">
-                    <span className="bg-slate-600 text-white text-xs font-bold px-2 py-1 rounded">
-                      {i + 1}
-                    </span>
-                    <div className="flex-1">
-                      <p className="text-white font-medium">{q.question}</p>
-                      <p className="text-slate-400 text-xs mt-1">{q.why}</p>
-                    </div>
-                  </div>
-                  {phase === 'critique' ? (
-                    <textarea
-                      value={answers[q.id] || ''}
-                      onChange={(e) => updateAnswer(q.id, e.target.value)}
-                      placeholder="Your answer (optional)"
-                      className="w-full mt-3 bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-white placeholder-slate-500 focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none text-sm"
-                      rows={2}
-                    />
-                  ) : answers[q.id]?.trim() ? (
-                    <div className="mt-3 bg-slate-700 rounded-lg px-3 py-2 text-sm text-green-300">
-                      {answers[q.id]}
-                    </div>
-                  ) : (
-                    <div className="mt-3 text-sm text-slate-500 italic">
-                      Skipped
-                    </div>
-                  )}
-                </div>
+                <QuestionCard
+                  key={q.id}
+                  question={q}
+                  index={i}
+                  answer={answers[q.id]}
+                  isEditable={phase === 'critique'}
+                  onAnswerChange={updateAnswer}
+                />
               ))}
             </div>
 
@@ -559,94 +513,14 @@ Examples:
 
         {/* Phase 3: Result */}
         {phase === 'result' && result && (
-          <div className={`bg-slate-800 rounded-xl p-4 md:p-6 border border-slate-700 ${isRegenerating ? 'opacity-50' : ''}`}>
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-3">
-                <h2 className="text-lg font-semibold text-white">Your Prompt</h2>
-                {isRegenerating && (
-                  <span className="flex items-center gap-2 text-sm text-blue-400">
-                    <span className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></span>
-                    Adapting for {GUIDANCE[selectedVendor].name}...
-                  </span>
-                )}
-              </div>
-              <button
-                onClick={() => copyToClipboard(result.generatedPrompt)}
-                disabled={isRegenerating}
-                className="text-sm text-blue-400 hover:text-blue-300 px-3 py-1 rounded hover:bg-slate-700 transition-colors disabled:opacity-50"
-              >
-                Copy
-              </button>
-            </div>
-            
-            <div className="bg-slate-900 rounded-lg px-4 py-4 text-white font-mono text-sm whitespace-pre-wrap max-h-80 overflow-y-auto border border-slate-700">
-              {result.generatedPrompt}
-            </div>
-
-            {result.summary && (
-              <div className="mt-4 p-3 bg-slate-700/50 rounded-lg">
-                <p className="text-slate-300 text-sm">{result.summary}</p>
-              </div>
-            )}
-
-            {error && (
-              <div className="mt-4 p-3 bg-red-900/30 border border-red-700 rounded-lg">
-                <p className="text-red-400 text-sm">{error}</p>
-              </div>
-            )}
-
-            {result.assumptions && result.assumptions.length > 0 && (
-              <div className="mt-6">
-                <h3 className="text-sm font-medium text-yellow-400 mb-3">Assumptions made</h3>
-                <div className="space-y-2">
-                  {result.assumptions.map((a, i) => (
-                    <div key={i} className="bg-slate-700/30 rounded p-3">
-                      <p className="text-yellow-300 text-sm">⚡ {a.assumption}</p>
-                      <p className="text-slate-500 text-xs mt-1">{a.reason}</p>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {result.structure && result.structure.length > 0 && (
-              <div className="mt-6">
-                <h3 className="text-sm font-medium text-slate-400 mb-3">Prompt structure</h3>
-                <div className="grid gap-2">
-                  {result.structure.map((s, i) => (
-                    <div key={i} className="flex items-start gap-3 text-sm">
-                      <span className="text-green-400 font-mono">{s.section}</span>
-                      <span className="text-slate-500">{s.purpose}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {result.suggestions && result.suggestions.length > 0 && (
-              <div className="mt-6">
-                <h3 className="text-sm font-medium text-slate-400 mb-2">Further improvements</h3>
-                <ul className="text-sm text-slate-400 space-y-1">
-                  {result.suggestions.map((s, i) => (
-                    <li key={i} className="flex items-start gap-2">
-                      <span className="text-slate-500">•</span> {s}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            <button
-              onClick={() => {
-                setInputText('');
-                resetToStart();
-              }}
-              disabled={isRegenerating}
-              className="mt-6 w-full py-2 rounded-lg font-medium text-slate-400 border border-slate-600 hover:border-slate-500 hover:text-white transition-colors disabled:opacity-50"
-            >
-              Start New Prompt
-            </button>
-          </div>
+          <ResultDisplay
+            result={result}
+            selectedVendor={selectedVendor}
+            isRegenerating={isRegenerating}
+            error={error}
+            onCopy={copyToClipboard}
+            onStartNew={handleStartNew}
+          />
         )}
 
         {/* Footer */}

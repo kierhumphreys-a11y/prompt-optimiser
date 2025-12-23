@@ -2,48 +2,87 @@ import { NextResponse } from 'next/server';
 import { GUIDANCE, formatGuidanceForAnalysis } from '@/lib/guidance';
 import { getSystemPrompt } from '@/lib/prompts';
 
-// Simple in-memory rate limiting
+// Efficient in-memory rate limiting using a circular buffer approach
 // Note: This resets when the server restarts. For production with multiple instances, use Redis.
-const rateLimit = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX = 20; // requests per window per IP
+
+// Store: Map<ip, { timestamps: number[], head: number, count: number, oldestTime: number }>
+// Uses a fixed-size circular buffer to avoid array reallocations
+const rateLimit = new Map();
 
 function checkRateLimit(ip) {
   const now = Date.now();
   const windowStart = now - RATE_LIMIT_WINDOW;
-  
+
   let entry = rateLimit.get(ip);
+
   if (!entry) {
-    entry = { requests: [] };
+    // Initialize with fixed-size buffer
+    entry = {
+      timestamps: new Array(RATE_LIMIT_MAX).fill(0),
+      head: 0,
+      count: 0
+    };
     rateLimit.set(ip, entry);
   }
-  
-  // Remove old requests outside the window
-  entry.requests = entry.requests.filter(time => time > windowStart);
-  
-  // Check if over limit
-  if (entry.requests.length >= RATE_LIMIT_MAX) {
+
+  // Quick check: if oldest recorded request is within window and we're at max, reject
+  // This avoids scanning in the common "at limit" case
+  if (entry.count >= RATE_LIMIT_MAX) {
+    const oldestIndex = (entry.head - entry.count + RATE_LIMIT_MAX) % RATE_LIMIT_MAX;
+    if (entry.timestamps[oldestIndex] > windowStart) {
+      return false; // Still at limit
+    }
+  }
+
+  // Count valid requests in window (O(n) but n is capped at RATE_LIMIT_MAX = 20)
+  let validCount = 0;
+  for (let i = 0; i < entry.count; i++) {
+    const idx = (entry.head - entry.count + i + RATE_LIMIT_MAX) % RATE_LIMIT_MAX;
+    if (entry.timestamps[idx] > windowStart) {
+      validCount++;
+    }
+  }
+
+  if (validCount >= RATE_LIMIT_MAX) {
     return false;
   }
-  
-  // Add this request
-  entry.requests.push(now);
+
+  // Add new request to circular buffer
+  entry.timestamps[entry.head] = now;
+  entry.head = (entry.head + 1) % RATE_LIMIT_MAX;
+  entry.count = Math.min(entry.count + 1, RATE_LIMIT_MAX);
+
   return true;
 }
 
-// Clean up old entries periodically
-if (typeof setInterval !== 'undefined') {
-  setInterval(() => {
-    const now = Date.now();
-    const windowStart = now - RATE_LIMIT_WINDOW;
-    
-    for (const [ip, entry] of rateLimit.entries()) {
-      entry.requests = entry.requests.filter(time => time > windowStart);
-      if (entry.requests.length === 0) {
-        rateLimit.delete(ip);
+// Lazy cleanup: only clean entries that haven't been accessed in 2x the window
+// This runs less frequently and does less work
+let lastCleanup = Date.now();
+const CLEANUP_INTERVAL = RATE_LIMIT_WINDOW * 2;
+
+function maybeCleanup() {
+  const now = Date.now();
+  if (now - lastCleanup < CLEANUP_INTERVAL) return;
+  lastCleanup = now;
+
+  const windowStart = now - RATE_LIMIT_WINDOW;
+
+  // Only delete entries where all timestamps are expired
+  for (const [ip, entry] of rateLimit.entries()) {
+    let hasValid = false;
+    for (let i = 0; i < entry.count; i++) {
+      const idx = (entry.head - entry.count + i + RATE_LIMIT_MAX) % RATE_LIMIT_MAX;
+      if (entry.timestamps[idx] > windowStart) {
+        hasValid = true;
+        break;
       }
     }
-  }, RATE_LIMIT_WINDOW);
+    if (!hasValid) {
+      rateLimit.delete(ip);
+    }
+  }
 }
 
 // Validate and sanitize IP address to prevent spoofing
@@ -82,9 +121,12 @@ function getClientIdentifier(request) {
 }
 
 export async function POST(request) {
+  // Lazy cleanup of expired rate limit entries
+  maybeCleanup();
+
   // Get client identifier for rate limiting
   const clientId = getClientIdentifier(request);
-  
+
   // Check rate limit
   if (!checkRateLimit(clientId)) {
     return NextResponse.json(
@@ -201,41 +243,49 @@ export async function POST(request) {
     }
     
     const data = await response.json();
-    
-    // Extract text content
-    const responseText = data.content
-      ?.filter(item => item.type === 'text')
-      ?.map(item => item.text)
-      ?.join('') || '';
-    
+
+    // Extract text content using single reduce (more efficient than filter+map+join)
+    const responseText = data.content?.reduce((acc, item) =>
+      item.type === 'text' ? acc + item.text : acc, '') || '';
+
     if (!responseText) {
       return NextResponse.json(
         { error: 'Empty response from API' },
         { status: 500 }
       );
     }
-    
+
     // Parse the JSON response
     let parsed;
     try {
-      // Remove markdown code blocks if present
+      // Extract JSON content - try to find the JSON object directly
       let jsonStr = responseText;
-      const codeBlockMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
-      if (codeBlockMatch) {
-        jsonStr = codeBlockMatch[1];
+
+      // Check for markdown code blocks (common LLM output format)
+      const codeBlockStart = jsonStr.indexOf('```');
+      if (codeBlockStart !== -1) {
+        const codeBlockEnd = jsonStr.indexOf('```', codeBlockStart + 3);
+        if (codeBlockEnd !== -1) {
+          // Extract content between code blocks, skip optional 'json' label
+          jsonStr = jsonStr.substring(codeBlockStart + 3, codeBlockEnd);
+          if (jsonStr.startsWith('json')) {
+            jsonStr = jsonStr.substring(4);
+          }
+        }
       }
-      
-      // Find JSON object
-      const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
+
+      // Find JSON object boundaries (more efficient than regex for large strings)
+      const jsonStart = jsonStr.indexOf('{');
+      const jsonEnd = jsonStr.lastIndexOf('}');
+      if (jsonStart === -1 || jsonEnd === -1 || jsonEnd < jsonStart) {
         throw new Error('No JSON found in response');
       }
-      
-      // Clean up common JSON issues
-      let cleanJson = jsonMatch[0]
+
+      // Extract and clean JSON
+      let cleanJson = jsonStr.substring(jsonStart, jsonEnd + 1)
         .replace(/,\s*}/g, '}')
         .replace(/,\s*]/g, ']');
-      
+
       parsed = JSON.parse(cleanJson);
     } catch (parseError) {
       // SECURITY: Only log error type, not response content which may contain sensitive data
