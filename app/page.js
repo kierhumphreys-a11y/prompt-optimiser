@@ -27,6 +27,7 @@ export default function Home() {
   const [error, setError] = useState('');
   const [isRegenerating, setIsRegenerating] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
+  const [isImplementingSuggestions, setIsImplementingSuggestions] = useState(false);
 
   const vendors = Object.keys(GUIDANCE);
   const currentGuidance = GUIDANCE[selectedVendor];
@@ -201,6 +202,55 @@ export default function Home() {
       setError(err.message);
     } finally {
       setIsRegenerating(false);
+    }
+  };
+
+  // Implement suggestions
+  const implementSuggestions = async () => {
+    if (!result?.suggestions || result.suggestions.length === 0) return;
+
+    setIsImplementingSuggestions(true);
+    setError('');
+
+    const answeredQuestions = critique?.questions?.filter(q => answers[q.id]?.trim()) || [];
+    let additionalContext = '';
+
+    if (answeredQuestions.length > 0) {
+      additionalContext = answeredQuestions
+        .map(q => `Q: ${q.question}\nA: ${answers[q.id]}`)
+        .join('\n\n');
+    }
+
+    // Add suggestions as additional instructions
+    const suggestionsContext = `\n\nPlease also implement these improvements:\n${result.suggestions.map((s, i) => `${i + 1}. ${s}`).join('\n')}`;
+    additionalContext += suggestionsContext;
+
+    try {
+      const response = await fetch('/api/analyse', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: 'generate',
+          vendor: selectedVendor,
+          model: selectedModel,
+          inputText: inputText.trim(),
+          additionalContext,
+          problemContext: problemContext.trim() || null
+        })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Request failed');
+      }
+
+      setResult(data);
+
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setIsImplementingSuggestions(false);
     }
   };
 
@@ -626,13 +676,31 @@ Examples:
             {result.suggestions && result.suggestions.length > 0 && (
               <div className="mt-6">
                 <h3 className="text-sm font-medium text-slate-400 mb-2">Further improvements</h3>
-                <ul className="text-sm text-slate-400 space-y-1">
+                <ul className="text-sm text-slate-400 space-y-1 mb-3">
                   {result.suggestions.map((s, i) => (
                     <li key={i} className="flex items-start gap-2">
                       <span className="text-slate-500">•</span> {s}
                     </li>
                   ))}
                 </ul>
+                <button
+                  onClick={implementSuggestions}
+                  disabled={isImplementingSuggestions || isRegenerating}
+                  className={`w-full py-2 rounded-lg font-medium transition-colors text-sm ${
+                    isImplementingSuggestions || isRegenerating
+                      ? 'bg-slate-600 text-slate-400 cursor-not-allowed'
+                      : 'bg-blue-600 text-white hover:bg-blue-500'
+                  }`}
+                >
+                  {isImplementingSuggestions ? (
+                    <span className="flex items-center justify-center gap-2">
+                      <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                      Implementing suggestions...
+                    </span>
+                  ) : (
+                    '✨ Implement these suggestions for me'
+                  )}
+                </button>
               </div>
             )}
 
