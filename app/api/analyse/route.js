@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { GUIDANCE, formatGuidanceForAnalysis } from '@/lib/guidance';
+import { getGuidance, formatGuidanceForAnalysis } from '@/lib/guidance';
 import { getSystemPrompt } from '@/lib/prompts';
 
 // Simple in-memory rate limiting
@@ -115,14 +115,6 @@ export async function POST(request) {
       );
     }
     
-    // Validate vendor
-    if (!GUIDANCE[vendor]) {
-      return NextResponse.json(
-        { error: 'Invalid vendor' },
-        { status: 400 }
-      );
-    }
-    
     // Validate mode
     if (!['critique', 'optimise', 'generate'].includes(mode)) {
       return NextResponse.json(
@@ -130,7 +122,7 @@ export async function POST(request) {
         { status: 400 }
       );
     }
-    
+
     // Validate input length (prevent abuse)
     if (inputText.length > 50000) {
       return NextResponse.json(
@@ -138,15 +130,26 @@ export async function POST(request) {
         { status: 400 }
       );
     }
-    
+
+    // Get guidance data (from Notion or fallback)
+    const guidanceData = await getGuidance();
+
+    // Validate vendor
+    if (!guidanceData[vendor]) {
+      return NextResponse.json(
+        { error: 'Invalid vendor' },
+        { status: 400 }
+      );
+    }
+
     // Build the prompt
-    const guidance = formatGuidanceForAnalysis(vendor);
+    const guidance = await formatGuidanceForAnalysis(vendor);
     const systemPrompt = getSystemPrompt(mode, vendor, model, guidance, {
       additionalContext: additionalContext || '',
       entryMode: entryMode || 'idea',
       problemContext: problemContext || ''
     });
-    const vendorName = GUIDANCE[vendor].name;
+    const vendorName = guidanceData[vendor].name;
     
     let userMessage;
     if (mode === 'critique') {
