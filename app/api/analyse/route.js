@@ -14,7 +14,7 @@ function checkRateLimit(ip) {
   
   let entry = rateLimit.get(ip);
   if (!entry) {
-    entry = { requests: [], blocked: false };
+    entry = { requests: [] };
     rateLimit.set(ip, entry);
   }
   
@@ -46,14 +46,47 @@ if (typeof setInterval !== 'undefined') {
   }, RATE_LIMIT_WINDOW);
 }
 
+// Validate and sanitize IP address to prevent spoofing
+function getClientIdentifier(request) {
+  // SECURITY: x-forwarded-for can be spoofed by clients.
+  // This rate limiting is defense-in-depth, not a security boundary.
+  // For production, use a trusted reverse proxy that overwrites (not appends to) this header,
+  // or use an external rate limiting service (e.g., Vercel's built-in, Cloudflare, Redis).
+
+  const forwardedFor = request.headers.get('x-forwarded-for');
+  const realIp = request.headers.get('x-real-ip');
+
+  // Get the first IP from x-forwarded-for (client IP in most proxy setups)
+  let ip = forwardedFor?.split(',')[0] || realIp || '';
+
+  // Trim whitespace and validate basic IP format
+  ip = ip.trim();
+
+  // Basic IPv4/IPv6 validation - reject obviously invalid values
+  const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+  const ipv6Regex = /^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$/;
+
+  if (ip && (ipv4Regex.test(ip) || ipv6Regex.test(ip))) {
+    return ip;
+  }
+
+  // Fallback: Use a combination of headers to create a fingerprint
+  // This makes it harder to bypass by simply omitting headers
+  const userAgent = request.headers.get('user-agent') || '';
+  const acceptLang = request.headers.get('accept-language') || '';
+
+  // Create a simple hash-like identifier from available headers
+  // This is not cryptographically secure but provides some differentiation
+  const fallbackId = `anon_${Buffer.from(userAgent + acceptLang).toString('base64').substring(0, 16)}`;
+  return fallbackId;
+}
+
 export async function POST(request) {
-  // Get client IP for rate limiting
-  const ip = request.headers.get('x-forwarded-for')?.split(',')[0] || 
-             request.headers.get('x-real-ip') || 
-             'unknown';
+  // Get client identifier for rate limiting
+  const clientId = getClientIdentifier(request);
   
   // Check rate limit
-  if (!checkRateLimit(ip)) {
+  if (!checkRateLimit(clientId)) {
     return NextResponse.json(
       { error: 'Too many requests. Please wait a moment and try again.' },
       { status: 429 }
@@ -144,7 +177,8 @@ export async function POST(request) {
     
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
-      console.error('Anthropic API error:', response.status, errorData);
+      // SECURITY: Only log status code, not full error response which may contain sensitive data
+      console.error('Anthropic API error: status', response.status);
       
       if (response.status === 429) {
         return NextResponse.json(
@@ -204,8 +238,8 @@ export async function POST(request) {
       
       parsed = JSON.parse(cleanJson);
     } catch (parseError) {
-      console.error('JSON parse error:', parseError.message);
-      console.error('Response text (first 1000 chars):', responseText.substring(0, 1000));
+      // SECURITY: Only log error type, not response content which may contain sensitive data
+      console.error('JSON parse error:', parseError.name);
       return NextResponse.json(
         { error: 'Failed to parse response. Please try again.' },
         { status: 500 }
@@ -215,7 +249,8 @@ export async function POST(request) {
     return NextResponse.json(parsed);
     
   } catch (error) {
-    console.error('Request error:', error);
+    // SECURITY: Only log error name, not full stack trace which may expose implementation details
+    console.error('Request error:', error.name || 'Unknown');
     return NextResponse.json(
       { error: 'An unexpected error occurred. Please try again.' },
       { status: 500 }
